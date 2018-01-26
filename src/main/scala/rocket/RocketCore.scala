@@ -173,8 +173,9 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val take_pc = take_pc_mem_wb
 
   // ctx decode
-  val inject_inst = Wire(Bool())
-  val inject_inst_reg = RegNext(inject_inst)
+  val id_reg_mpc = Reg(init=UInt(0, 2))
+  //val inject_inst = Wire(Bool())
+  //val inject_inst_reg = RegNext(inject_inst)
   val exp = Module(new RVCExpander)
   val empty_inst_raw = UInt(0x33, 32)
   exp.io.in := empty_inst_raw
@@ -183,9 +184,9 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   // decode stage
   val ibuf = Module(new IBuf)
   val id_expanded_inst = for (i <- 0 until decodeWidth)
-    yield Mux(inject_inst_reg, empty_inst, ibuf.io.inst(i).bits.inst)
+    yield Mux(id_reg_mpc =/= UInt(0), empty_inst, ibuf.io.inst(i).bits.inst)
   val id_raw_inst = for (i <- 0 until decodeWidth)
-    yield Mux(inject_inst_reg, empty_inst_raw, ibuf.io.inst(i).bits.raw)
+    yield Mux(id_reg_mpc =/= UInt(0), empty_inst_raw, ibuf.io.inst(i).bits.raw)
   val id_inst = id_expanded_inst.map(_.bits)
   ibuf.io.imem <> io.imem.resp
   ibuf.io.kill := take_pc
@@ -314,20 +315,9 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_xcpt := !ctrl_killd && id_xcpt
   ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
 
-  inject_inst := Bool(false)
-  when (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XRD && ibuf.io.inst(0).valid && !inject_inst_reg) {
-    printf("C%d: %d LOAD operation\n", io.hartid, csr.io.time(31,0))
-    inject_inst := Bool(true)
-  }
-
-  when (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XWR && ibuf.io.inst(0).valid && !inject_inst_reg) {
-    printf("C%d: %d STORE operation\n", io.hartid, csr.io.time(31,0))
-    inject_inst := Bool(true)
-  }
-
   when (!ctrl_killd) {
     ex_ctrl := id_ctrl
-    ex_reg_rvc := Mux(inject_inst_reg, Bool(false), ibuf.io.inst(0).bits.rvc)
+    ex_reg_rvc := Mux(id_reg_mpc =/= UInt(0), Bool(false), ibuf.io.inst(0).bits.rvc)
     ex_ctrl.csr := id_csr
     when (id_fence_next) { id_reg_fence := true }
     when (id_xcpt) { // pass PC down ALU writeback pipeline for badaddr
@@ -372,8 +362,8 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     ex_reg_cause := id_cause
     ex_reg_inst := id_inst(0)
     ex_reg_raw_inst := id_raw_inst(0)
-    ex_reg_pc := Mux(inject_inst_reg, ex_reg_pc, ibuf.io.pc)
-    ex_reg_mpc := Mux(inject_inst_reg, UInt(1), UInt(0))
+    ex_reg_pc := Mux(id_reg_mpc =/= UInt(0), ex_reg_pc, ibuf.io.pc)
+    ex_reg_mpc := id_reg_mpc
     ex_reg_btb_resp := ibuf.io.btb_resp
   }
 
@@ -642,7 +632,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.div && (!(div.io.req.ready || (div.io.resp.valid && !wb_wxd)) || div.io.req.valid) || // reduce odds of replay
     id_do_fence ||
     csr.io.csr_stall
-  ctrl_killd := !inject_inst_reg && (!ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
+  ctrl_killd := (id_reg_mpc === UInt(0)) && (!ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -658,7 +648,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   io.imem.sfence.bits.asid := wb_reg_rs2
   io.ptw.sfence := io.imem.sfence
 
-  ibuf.io.inst(0).ready := !ctrl_stalld && !inject_inst_reg
+  ibuf.io.inst(0).ready := !ctrl_stalld && id_reg_mpc === UInt(0)
 
   io.imem.btb_update.valid := mem_reg_valid && !take_pc_wb && mem_wrong_npc && (!mem_cfi || mem_cfi_taken)
   io.imem.btb_update.bits.isValid := mem_cfi
@@ -708,6 +698,25 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   io.rocc.cmd.bits.rs1 := wb_reg_wdata
   io.rocc.cmd.bits.rs2 := wb_reg_rs2
 
+  // ctx decode
+  when (take_pc_mem_wb || csr.io.interrupt) {
+    id_reg_mpc := UInt(0)
+  } .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XRD && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
+    printf("C%d: %d LOAD operation\n", io.hartid, csr.io.time(31,0))
+    id_reg_mpc := UInt(1)
+  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+    id_reg_mpc := UInt(0)
+  }
+
+  when (take_pc_mem_wb || csr.io.interrupt) {
+    id_reg_mpc := UInt(0)
+  } .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XWR && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
+    printf("C%d: %d STORE operation\n", io.hartid, csr.io.time(31,0))
+    id_reg_mpc := UInt(1)
+  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+    id_reg_mpc := UInt(0)
+  }
+
   // evaluate performance counters
   val icache_blocked = !(io.imem.resp.valid || RegNext(io.imem.resp.valid))
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
@@ -739,7 +748,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     }
   }
   else {
-    printf("C%d: %d ctrl_stalld=[%d] ctrl_killd=[%d] inject_inst=[%d] inject_inst_reg=[%d] id_inst=[%x][%x][%x][%x]\n", io.hartid, csr.io.time(31,0), ctrl_stalld, ctrl_killd, inject_inst, inject_inst_reg, id_inst(0), ex_reg_inst, mem_reg_inst, wb_reg_inst)
+    printf("C%d: %d ctrl_stalld=[%d] ctrl_killd=[%d] id_reg_mpc=[%d] id_inst=[%x][%x][%x][%x]\n", io.hartid, csr.io.time(31,0), ctrl_stalld, ctrl_killd, id_reg_mpc, id_inst(0), ex_reg_inst, mem_reg_inst, wb_reg_inst)
     printf("C%d: %d [%d] pc=[%x] W[r%d=%x][%d] R[r%d=%x] R[r%d=%x] inst=[%x] DASM(%x)\n",
          io.hartid, csr.io.time(31,0), csr.io.trace(0).valid && !csr.io.trace(0).exception,
          csr.io.trace(0).iaddr(vaddrBitsExtended-1, 0),
