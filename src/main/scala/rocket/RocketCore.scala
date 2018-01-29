@@ -174,19 +174,18 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
 
   // ctx decode
   val id_reg_mpc = Reg(init=UInt(0, 2))
-  //val inject_inst = Wire(Bool())
-  //val inject_inst_reg = RegNext(inject_inst)
   val exp = Module(new RVCExpander)
-  val empty_inst_raw = UInt(0x33, 32)
-  exp.io.in := empty_inst_raw
-  val empty_inst = exp.io.out
+  val inst_vec = Vec(UInt(0x33), UInt(0x8033), UInt(0x10033), UInt(0x18033))
+  val inject_inst_raw = inst_vec(id_reg_mpc)
+  exp.io.in := inject_inst_raw
+  val inject_inst = exp.io.out
   
   // decode stage
   val ibuf = Module(new IBuf)
   val id_expanded_inst = for (i <- 0 until decodeWidth)
-    yield Mux(id_reg_mpc =/= UInt(0), empty_inst, ibuf.io.inst(i).bits.inst)
+    yield Mux(id_reg_mpc =/= UInt(0), inject_inst, ibuf.io.inst(i).bits.inst)
   val id_raw_inst = for (i <- 0 until decodeWidth)
-    yield Mux(id_reg_mpc =/= UInt(0), empty_inst_raw, ibuf.io.inst(i).bits.raw)
+    yield Mux(id_reg_mpc =/= UInt(0), inject_inst_raw, ibuf.io.inst(i).bits.raw)
   val id_inst = id_expanded_inst.map(_.bits)
   ibuf.io.imem <> io.imem.resp
   ibuf.io.kill := take_pc
@@ -392,9 +391,10 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     Mux(mem_ctrl.jal, ImmGen(IMM_UJ, mem_reg_inst),
     Mux(mem_reg_rvc, SInt(2), SInt(4))))
   val mem_npc = (Mux(mem_ctrl.jalr || mem_reg_sfence, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).asSInt, mem_br_target) & SInt(-2)).asUInt
+  val mem_nmpc = mem_reg_mpc + UInt(1)
   val mem_wrong_npc =
-    Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= UInt(1)),
-    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= UInt(1)), Bool(true)))
+    Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc),
+    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc), Bool(true)))
   val mem_npc_misaligned = !csr.io.status.isa('c'-'a') && mem_npc(1) && !mem_reg_sfence
   val mem_int_wdata = Mux(!mem_reg_xcpt && (mem_ctrl.jalr ^ mem_npc_misaligned), mem_br_target, mem_reg_wdata.asSInt).asUInt
   val mem_cfi = mem_ctrl.branch || mem_ctrl.jalr || mem_ctrl.jal
@@ -704,8 +704,10 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   } .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XRD && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
     printf("C%d: %d LOAD operation\n", io.hartid, csr.io.time(31,0))
     id_reg_mpc := UInt(1)
-  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+  } .elsewhen (id_reg_mpc === UInt(3) && !ctrl_stalld) {
     id_reg_mpc := UInt(0)
+  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+    id_reg_mpc := id_reg_mpc + UInt(1)
   }
 
   when (take_pc_mem_wb || csr.io.interrupt) {
@@ -713,8 +715,10 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   } .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XWR && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
     printf("C%d: %d STORE operation\n", io.hartid, csr.io.time(31,0))
     id_reg_mpc := UInt(1)
-  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+  } .elsewhen (id_reg_mpc === UInt(3) && !ctrl_stalld) {
     id_reg_mpc := UInt(0)
+  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+    id_reg_mpc := id_reg_mpc + UInt(1)
   }
 
   // evaluate performance counters
