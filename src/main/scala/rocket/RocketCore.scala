@@ -175,7 +175,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   // ctx decode
   val id_reg_mpc = Reg(init=UInt(0, 2))
   val exp = Module(new RVCExpander)
-  val inst_vec = Vec(UInt(0x33), UInt(0x8033), UInt(0x10033), UInt(0x18033))
+  val inst_vec = Vec(UInt(0x33), UInt(0x8033), UInt(0x10033), UInt(0x33))
   val inject_inst_raw = inst_vec(id_reg_mpc)
   exp.io.in := inject_inst_raw
   val inject_inst = exp.io.out
@@ -393,8 +393,8 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val mem_npc = (Mux(mem_ctrl.jalr || mem_reg_sfence, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).asSInt, mem_br_target) & SInt(-2)).asUInt
   val mem_nmpc = mem_reg_mpc + UInt(1)
   val mem_wrong_npc =
-    Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc),
-    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc), Bool(true)))
+    Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc && ex_reg_mpc =/= UInt(1)),
+    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc && ex_reg_mpc =/= UInt(1)), Bool(true)))
   val mem_npc_misaligned = !csr.io.status.isa('c'-'a') && mem_npc(1) && !mem_reg_sfence
   val mem_int_wdata = Mux(!mem_reg_xcpt && (mem_ctrl.jalr ^ mem_npc_misaligned), mem_br_target, mem_reg_wdata.asSInt).asUInt
   val mem_cfi = mem_ctrl.branch || mem_ctrl.jalr || mem_ctrl.jal
@@ -699,27 +699,35 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   io.rocc.cmd.bits.rs2 := wb_reg_rs2
 
   // ctx decode
+  val mcounter = Reg(UInt(width=2))
   when (take_pc_mem_wb || csr.io.interrupt) {
+    mcounter := UInt(0)
     id_reg_mpc := UInt(0)
   } .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XRD && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
     printf("C%d: %d LOAD operation\n", io.hartid, csr.io.time(31,0))
+    mcounter := UInt(0)
     id_reg_mpc := UInt(1)
-  } .elsewhen (id_reg_mpc === UInt(3) && !ctrl_stalld) {
-    id_reg_mpc := UInt(0)
   } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
-    id_reg_mpc := id_reg_mpc + UInt(1)
+    when (id_raw_inst(0) === UInt(0x33) && mcounter =/= UInt(1)) {
+      mcounter := mcounter + UInt(1)
+      id_reg_mpc := UInt(1)
+    } .elsewhen (id_reg_mpc === UInt(3)) {
+      id_reg_mpc := UInt(0)
+    } .otherwise {
+      id_reg_mpc := id_reg_mpc + UInt(1)
+    }
   }
 
-  when (take_pc_mem_wb || csr.io.interrupt) {
-    id_reg_mpc := UInt(0)
-  } .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XWR && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
-    printf("C%d: %d STORE operation\n", io.hartid, csr.io.time(31,0))
-    id_reg_mpc := UInt(1)
-  } .elsewhen (id_reg_mpc === UInt(3) && !ctrl_stalld) {
-    id_reg_mpc := UInt(0)
-  } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
-    id_reg_mpc := id_reg_mpc + UInt(1)
-  }
+  //when (take_pc_mem_wb || csr.io.interrupt) {
+  //  id_reg_mpc := UInt(0)
+  //} .elsewhen (!ctrl_killd && id_ctrl.mem === Y && id_ctrl.mem_cmd === M_XWR && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
+  //  printf("C%d: %d STORE operation\n", io.hartid, csr.io.time(31,0))
+  //  id_reg_mpc := UInt(1)
+  //} .elsewhen (id_reg_mpc === UInt(3) && !ctrl_stalld) {
+  //  id_reg_mpc := UInt(0)
+  //} .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
+  //  id_reg_mpc := id_reg_mpc + UInt(1)
+  //}
 
   // evaluate performance counters
   val icache_blocked = !(io.imem.resp.valid || RegNext(io.imem.resp.valid))
@@ -752,7 +760,12 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     }
   }
   else {
-    printf("C%d: %d ctrl_stalld=[%d] ctrl_killd=[%d] id_reg_mpc=[%d] id_inst=[%x][%x][%x][%x]\n", io.hartid, csr.io.time(31,0), ctrl_stalld, ctrl_killd, id_reg_mpc, id_inst(0), ex_reg_inst, mem_reg_inst, wb_reg_inst)
+    if (usingRoCC) {
+      when (io.hartid === UInt(0)) {
+        printf("usingRoCC\n")
+      }
+    }
+    printf("C%d: %d ctrl_stalld=[%d] ctrl_killd=[%d] id_reg_mpc=[%d] mcounter=[%d] id_inst=[%x][%x][%x][%x]\n", io.hartid, csr.io.time(31,0), ctrl_stalld, ctrl_killd, id_reg_mpc, mcounter, id_inst(0), ex_reg_inst, mem_reg_inst, wb_reg_inst)
     printf("C%d: %d [%d] pc=[%x] W[r%d=%x][%d] R[r%d=%x] R[r%d=%x] inst=[%x] DASM(%x)\n",
          io.hartid, csr.io.time(31,0), csr.io.trace(0).valid && !csr.io.trace(0).exception,
          csr.io.trace(0).iaddr(vaddrBitsExtended-1, 0),
