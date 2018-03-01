@@ -114,6 +114,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     ((xLen > 32).option(new I64Decode)) ++:
     (usingVM.option(new SDecode)) ++:
     (usingDebug.option(new DebugDecode)) ++:
+    (true.option(new CTXDecode)) ++:
     Seq(new IDecode)
   } flatMap(_.table)
 
@@ -132,6 +133,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val ex_reg_replay = Reg(Bool())
   val ex_reg_pc = Reg(UInt())
   val ex_reg_mpc = Reg(UInt())
+  val ex_reg_ctx = Reg(Bool())
   val ex_reg_inst = Reg(Bits())
   val ex_reg_raw_inst = Reg(UInt())
 
@@ -149,6 +151,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val mem_reg_sfence = Reg(Bool())
   val mem_reg_pc = Reg(UInt())
   val mem_reg_mpc = Reg(UInt())
+  val mem_reg_ctx = Reg(Bool())
   val mem_reg_inst = Reg(Bits())
   val mem_reg_raw_inst = Reg(UInt())
   val mem_reg_wdata = Reg(Bits())
@@ -164,6 +167,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val wb_reg_sfence = Reg(Bool())
   val wb_reg_pc = Reg(UInt())
   val wb_reg_mpc = Reg(UInt())
+  val wb_reg_ctx = Reg(Bool())
   val wb_reg_inst = Reg(Bits())
   val wb_reg_raw_inst = Reg(UInt())
   val wb_reg_wdata = Reg(Bits())
@@ -174,6 +178,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val take_pc = take_pc_mem_wb
 
   // ctx decode
+  val id_ctx = Wire(Bool())
   val mcounter = Reg(UInt(width=2))
   val ex_reg_mcounter = Reg(UInt(width=2))
   val mem_reg_mcounter = Reg(UInt(width=2))
@@ -181,9 +186,9 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val take_mpc_mem = Wire(Bool())
   val take_mpc_wb = Wire(Bool())
   val mreplay_wb = Wire(Bool())
-  val id_reg_mpc = Reg(init=UInt(0, 2))
+  val id_reg_mpc = Reg(init=UInt(0, 4))
   val exp = Module(new RVCExpander)
-  val inst_vec = Vec(UInt(0x33), UInt(0x8033), UInt(0x10033), UInt(0x33))
+  val inst_vec = Vec(UInt(0x33), UInt(0x8033), "h_fe00_3fab".asUInt, UInt(0x10033))
   val inject_inst_raw = inst_vec(id_reg_mpc)
   exp.io.in := inject_inst_raw
   val inject_inst = exp.io.out
@@ -383,6 +388,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     ex_reg_raw_inst := id_raw_inst(0)
     ex_reg_pc := id_pc
     ex_reg_mpc := id_reg_mpc
+    ex_reg_ctx := id_ctx
     ex_reg_mcounter := mcounter
     ex_reg_btb_resp := ibuf.io.btb_resp
   }
@@ -412,10 +418,14 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     Mux(mem_ctrl.jal, ImmGen(IMM_UJ, mem_reg_inst),
     Mux(mem_reg_rvc, SInt(2), SInt(4))))
   val mem_npc = (Mux(mem_ctrl.jalr || mem_reg_sfence, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).asSInt, mem_br_target) & SInt(-2)).asUInt
-  val mem_nmpc = mem_reg_mpc + UInt(1)
+  val mem_nmpc = 
+    (Mux(!mem_reg_ctx, SInt(0),
+    Mux(mem_ctrl.mbranch && mem_br_taken, mem_reg_mpc.asSInt + ImmGen(IMM_S, mem_reg_inst),
+    Mux(mem_reg_mpc === UInt(3), SInt(0), mem_reg_mpc.asSInt + SInt(1))))).asUInt
   val mem_wrong_npc =
-    Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc && ex_reg_mpc =/= UInt(1)),
-    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (mem_reg_pc =/= ex_reg_pc || ex_reg_mpc =/= mem_nmpc && ex_reg_mpc =/= UInt(1)), Bool(true)))
+    Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (!mem_reg_ctx || mem_reg_pc =/= ex_reg_pc),
+    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (!mem_reg_ctx || mem_reg_pc =/= ex_reg_pc), Bool(true)))
+  val mem_wrong_nmpc = ex_pc_valid && mem_reg_ctx && mem_nmpc =/= ex_reg_mpc
   val mem_npc_misaligned = !csr.io.status.isa('c'-'a') && mem_npc(1) && !mem_reg_sfence
   val mem_int_wdata = Mux(!mem_reg_xcpt && (mem_ctrl.jalr ^ mem_npc_misaligned), mem_br_target, mem_reg_wdata.asSInt).asUInt
   val mem_cfi = mem_ctrl.branch || mem_ctrl.jalr || mem_ctrl.jal
@@ -425,7 +435,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val mem_injected_branch = mem_reg_mpc =/= UInt(0) && mem_ctrl.branch
   val mem_injected_jump = mem_reg_mpc =/= UInt(0) && (mem_ctrl.jal || mem_ctrl.jalr)
   take_pc_mem := mem_reg_valid && (mem_misprediction || mem_reg_sfence || mem_injected_branch || mem_injected_jump)
-  take_mpc_mem := mem_reg_valid && mem_reg_raw_inst === UInt(0x33) && mem_reg_mcounter =/= UInt(1)
+  take_mpc_mem := mem_reg_valid && mem_wrong_nmpc && mem_reg_mcounter =/= UInt(1)
 
   mem_reg_valid := !ctrl_killx
   mem_reg_replay := !take_pc_mem_wb && replay_ex
@@ -451,6 +461,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_raw_inst := ex_reg_raw_inst
     mem_reg_pc := ex_reg_pc
     mem_reg_mpc := ex_reg_mpc
+    mem_reg_ctx := ex_reg_ctx
     mem_reg_mcounter := ex_reg_mcounter
     mem_reg_wdata := alu.io.out
     mem_br_taken := alu.io.cmp_out
@@ -508,6 +519,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     wb_reg_raw_inst := mem_reg_raw_inst
     wb_reg_pc := mem_reg_pc
     wb_reg_mpc := mem_reg_mpc
+    wb_reg_ctx := mem_reg_ctx
     wb_reg_mcounter := mem_reg_mcounter
   }
 
@@ -729,6 +741,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   io.rocc.cmd.bits.rs2 := wb_reg_rs2
 
   // ctx decode
+  id_ctx := Bool(false)
   when (mem_injected_branch || mem_injected_jump || take_pc_mem_wb && !mreplay_wb && !take_mpc_mem || csr.io.interrupt) {
     mcounter := UInt(0)
     id_reg_mpc := UInt(0)
@@ -740,6 +753,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     inject_triggered := Bool(true)
     mcounter := UInt(0)
     id_reg_mpc := UInt(1)
+    id_ctx := Bool(true)
   } .elsewhen (take_mpc_mem) {
     mcounter := mcounter + UInt(1)
     id_reg_mpc := UInt(1)
@@ -749,6 +763,10 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     } .otherwise {
       id_reg_mpc := id_reg_mpc + UInt(1)
     }
+  }
+
+  when (inject_triggered) {
+    id_ctx := Bool(true)
   }
 
   when (mem_reg_valid && mem_reg_mpc === UInt(3) && !take_mpc_mem) {
