@@ -188,13 +188,13 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val mreplay_wb = Wire(Bool())
   val id_reg_mpc = Reg(init=UInt(0, 4))
   val exp = Module(new RVCExpander)
-  val inst_vec = Vec(UInt(0x33), UInt(0x8033), "h_fe00_3fab".asUInt, UInt(0x10033))
+  val inst_vec = Vec(UInt(0x33), UInt(0x8033), UInt(0x10033), "h_fe00_3f2b".asUInt)
   val inject_inst_raw = inst_vec(id_reg_mpc)
   exp.io.in := inject_inst_raw
   val inject_inst = exp.io.out
   val id_reg_locked_pc = Reg(UInt())
   val inject_trigger = Wire(Bool())
-  val inject_triggered = Reg(init=Bool(true))
+  val inject_triggered = Reg(init=Bool(false))
   
   // decode stage
   val ibuf = Module(new IBuf)
@@ -425,7 +425,10 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
   val mem_wrong_npc =
     Mux(ex_pc_valid, mem_npc =/= ex_reg_pc && (!mem_reg_ctx || mem_reg_pc =/= ex_reg_pc),
     Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc && (!mem_reg_ctx || mem_reg_pc =/= ex_reg_pc), Bool(true)))
-  val mem_wrong_nmpc = ex_pc_valid && mem_reg_ctx && mem_nmpc =/= ex_reg_mpc
+  val mem_wrong_nmpc =
+    Mux(!mem_reg_ctx, Bool(false),
+    Mux(ex_pc_valid, mem_nmpc =/= ex_reg_mpc,
+    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_nmpc =/= id_reg_mpc, Bool(true))))
   val mem_npc_misaligned = !csr.io.status.isa('c'-'a') && mem_npc(1) && !mem_reg_sfence
   val mem_int_wdata = Mux(!mem_reg_xcpt && (mem_ctrl.jalr ^ mem_npc_misaligned), mem_br_target, mem_reg_wdata.asSInt).asUInt
   val mem_cfi = mem_ctrl.branch || mem_ctrl.jalr || mem_ctrl.jal
@@ -672,8 +675,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.rocc && rocc_blocked || // reduce activity while RoCC is busy
     id_ctrl.div && (!(div.io.req.ready || (div.io.resp.valid && !wb_wxd)) || div.io.req.valid) || // reduce odds of replay
     id_do_fence ||
-    csr.io.csr_stall ||
-    inject_triggered && inject_trigger
+    csr.io.csr_stall
   ctrl_killd := (id_reg_mpc === UInt(0)) && (!ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay) || take_pc_mem_wb || take_mpc_mem || ctrl_stalld || csr.io.interrupt
 
   io.imem.req.valid := take_pc
@@ -748,15 +750,15 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     inject_triggered := Bool(false)
   } .elsewhen (mreplay_wb) {
     id_reg_mpc := wb_reg_mpc
+  } .elsewhen (take_mpc_mem) {
+    mcounter := mem_reg_mcounter + UInt(1)
+    id_reg_mpc := mem_nmpc
   } .elsewhen (!ctrl_killd && inject_trigger && ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay && id_reg_mpc === UInt(0)) {
     printf("C%d: %d LOAD operation\n", io.hartid, csr.io.time(31,0))
     inject_triggered := Bool(true)
     mcounter := UInt(0)
     id_reg_mpc := UInt(1)
     id_ctx := Bool(true)
-  } .elsewhen (take_mpc_mem) {
-    mcounter := mcounter + UInt(1)
-    id_reg_mpc := UInt(1)
   } .elsewhen (id_reg_mpc =/= UInt(0) && !ctrl_stalld) {
     when (id_reg_mpc === UInt(3)) {
       id_reg_mpc := UInt(0)
@@ -769,7 +771,7 @@ class Rocket(implicit p: Parameters) extends CoreModule()(p)
     id_ctx := Bool(true)
   }
 
-  when (mem_reg_valid && mem_reg_mpc === UInt(3) && !take_mpc_mem) {
+  when (mem_reg_valid && !take_pc_wb && mem_reg_mpc === UInt(3) && !take_mpc_mem) {
     inject_triggered := Bool(false)
   }
 
